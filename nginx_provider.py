@@ -39,7 +39,7 @@ class NginxProvider(IngressProvider):
             if tls_internal:
                 # Self-signed certs generated in nginx entrypoint
                 nginx_volumes.append(f"{volume_root}/nginx-certs:/etc/nginx/certs")
-                domains = sorted({e["host"] for e in entries})
+                domains = sorted({e["host"] for e in entries if e})
                 cert_cmds = " && ".join(
                     f"openssl req -x509 -nodes -days 365 -newkey rsa:2048 "
                     f"-keyout /etc/nginx/certs/{d}.key "
@@ -68,7 +68,7 @@ class NginxProvider(IngressProvider):
                 # ACME via certbot
                 nginx_volumes.append(f"{volume_root}/letsencrypt:/etc/letsencrypt:ro")
                 nginx_volumes.append(f"{volume_root}/certbot-webroot:/var/www/certbot:ro")
-                domains = sorted({e["host"] for e in entries if e.get("host")})
+                domains = sorted({e["host"] for e in entries if e and e.get("host")})
                 domain_flags = " ".join(f"-d {d}" for d in domains)
                 services = {
                     "nginx": {
@@ -104,7 +104,7 @@ class NginxProvider(IngressProvider):
         if not entries:
             return
 
-        ext_cfg = config.get("extensions", {}).get(self.name, {})
+        ext_cfg = (config.get("extensions") or {}).get(self.name, {})
         tls = _resolve_tls(ext_cfg)
 
         filename = "nginx.conf"
@@ -112,7 +112,7 @@ class NginxProvider(IngressProvider):
             project = config.get("name", "project")
             filename = f"nginx.conf-{project}"
 
-        by_host = _group_by_host(entries, config.get("replacements", []))
+        by_host = _group_by_host(entries, config.get("replacements") or [])
         upstreams = _collect_upstreams(by_host)
 
         path = os.path.join(output_dir, filename)
@@ -140,7 +140,11 @@ def _group_by_host(entries: list[dict], replacements: list) -> dict[str, list[di
     """Group entries by host, applying replacements to upstreams."""
     by_host: dict[str, list[dict]] = {}
     for e in entries:
+        if not e:
+            continue
         for r in replacements:
+            if not r:
+                continue
             e["upstream"] = e["upstream"].replace(r["old"], r["new"])
         by_host.setdefault(e["host"], []).append(e)
     return by_host
@@ -151,6 +155,8 @@ def _collect_upstreams(by_host: dict[str, list[dict]]) -> dict[str, str]:
     upstreams: dict[str, str] = {}
     for host_entries in by_host.values():
         for entry in host_entries:
+            if not entry:
+                continue
             upstreams[_upstream_name(entry["upstream"])] = entry["upstream"]
     return upstreams
 
@@ -178,8 +184,8 @@ def _write_server_block(f, host: str, host_entries: list[dict], tls: dict) -> No
         f.write("\t\t\troot /var/www/certbot;\n")
         f.write("\t\t}\n")
 
-    specific = [e for e in host_entries if e["path"] and e["path"] != "/"]
-    catchall = [e for e in host_entries if not e["path"] or e["path"] == "/"]
+    specific = [e for e in host_entries if e and e["path"] and e["path"] != "/"]
+    catchall = [e for e in host_entries if e and (not e["path"] or e["path"] == "/")]
     for entry in specific + catchall:
         _write_nginx_location(f, entry)
 
