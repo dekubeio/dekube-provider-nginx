@@ -65,28 +65,86 @@ class NginxProvider(IngressProvider):
                     "volumes": nginx_volumes,
                 }}
             else:
-                # ACME via certbot
-                nginx_volumes.append(f"{volume_root}/letsencrypt:/etc/letsencrypt:ro")
+                # ACME via certbot. nginx can't start with ssl_certificate
+                # pointing at a file that doesn't exist yet, and the real
+                # cert isn't there until certbot completes its first HTTP-01
+                # round trip — so nginx bootstraps its own throwaway
+                # self-signed placeholder per domain (same recipe as
+                # tls_internal above) if none exists, then reloads
+                # periodically so it picks up the real cert once certbot
+                # swaps it in. Needs write access to the letsencrypt volume
+                # (read-only in the tls_internal/tls_cert_path branches,
+                # where nginx never writes to it).
+                nginx_volumes.append(f"{volume_root}/letsencrypt:/etc/letsencrypt")
                 nginx_volumes.append(f"{volume_root}/certbot-webroot:/var/www/certbot:ro")
                 domains = sorted({e["host"] for e in entries if e and e.get("host")})
                 domain_flags = " ".join(f"-d {d}" for d in domains)
+                bootstrap_cmds = " && ".join(
+                    f"(test -f /etc/letsencrypt/live/{d}/fullchain.pem || "
+                    f"(mkdir -p /etc/letsencrypt/live/{d} && "
+                    f"openssl req -x509 -nodes -days 1 -newkey rsa:2048 "
+                    f"-keyout /etc/letsencrypt/live/{d}/privkey.pem "
+                    f"-out /etc/letsencrypt/live/{d}/fullchain.pem "
+                    f"-subj '/CN={d}'))"
+                    for d in domains
+                    if d
+                ) or "true"
+                # nginx:alpine ships libssl but not the openssl CLI — verified
+                # with `docker run --rm nginx:alpine which openssl` (not found).
+                # apk add it lazily (skip if already there, e.g. a same-container
+                # restart) rather than baking a custom image for one binary.
+                openssl_bootstrap = "command -v openssl >/dev/null 2>&1 || apk add --no-cache openssl >/dev/null 2>&1"
                 services = {
                     "nginx": {
                         "image": "nginx:alpine", "restart": "always",
                         "ports": ports,
                         "volumes": nginx_volumes,
+                        "entrypoint": [
+                            "/bin/sh", "-c",
+                            f"{openssl_bootstrap} && {bootstrap_cmds} && "
+                            # CBA: nginx reloads itself on a timer instead of
+                            # certbot signalling it directly — cross-container
+                            # signalling needs a shared PID namespace or the
+                            # docker socket, overkill for a single-node
+                            # compose stack. Ceiling: up to 6h of stale cert
+                            # after a renewal.
+                            "(while :; do sleep 6h; nginx -s reload; done &) "
+                            "&& nginx -g 'daemon off;'",
+                        ],
                     },
                     "certbot": {
-                        "image": "certbot/certbot", "restart": "no",
+                        "image": "certbot/certbot", "restart": "always",
                         "volumes": [
                             f"{volume_root}/letsencrypt:/etc/letsencrypt",
                             f"{volume_root}/certbot-webroot:/var/www/certbot",
                         ],
-                        "entrypoint": (
+                        "entrypoint": [
+                            "/bin/sh", "-c",
+                            # Clear nginx's placeholder before the FIRST real
+                            # issuance only: a renewal.conf means certbot has
+                            # already claimed the domain for real, so leave
+                            # it alone on subsequent restarts (re-deleting a
+                            # valid lineage every restart would force
+                            # re-issuance and risk the Let's Encrypt rate
+                            # limit).
+                            # $$d / $$! double-$: compose interpolates single-$
+                            # references in the YAML itself, so the shell
+                            # variables the *container* should see need escaping
+                            # (dekube-engine does this automatically for
+                            # workload command/args via
+                            # _escape_shell_vars_for_compose, but a provider
+                            # authoring its own entrypoint has to do it by hand).
+                            f"for d in {' '.join(domains)}; do "
+                            "test -f /etc/letsencrypt/renewal/$$d.conf || "
+                            "rm -rf /etc/letsencrypt/live/$$d /etc/letsencrypt/archive/$$d; "
+                            "done && "
                             f"certbot certonly --webroot -w /var/www/certbot "
                             f"--email {email} --agree-tos --no-eff-email "
-                            f"{domain_flags}"
-                        ),
+                            f"--non-interactive {domain_flags}; "
+                            "trap exit TERM; "
+                            "while :; do sleep 12h & wait $$!; "
+                            "certbot renew --webroot -w /var/www/certbot --quiet; done",
+                        ],
                     },
                 }
         else:
@@ -104,7 +162,7 @@ class NginxProvider(IngressProvider):
         if not entries:
             return
 
-        ext_cfg = (config.get("extensions") or {}).get(self.name, {})
+        ext_cfg = (config.get("extensions") or {}).get(self.name) or {}
         tls = _resolve_tls(ext_cfg)
 
         filename = "nginx.conf"

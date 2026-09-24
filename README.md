@@ -23,7 +23,7 @@ Nginx reverse proxy provider for [dekube](https://dekube.io) — converts Ingres
 | Config | Behavior |
 |--------|----------|
 | No `email`, no `tls_*` | Plain HTTP only (port 80) |
-| `extensions.nginx.email: admin@example.com` | ACME via certbot sidecar (ports 80 + 443) |
+| `extensions.nginx.email: admin@example.com` | ACME via certbot sidecar (ports 80 + 443) — nginx bootstraps a throwaway self-signed cert per domain so it can start before certbot has issued the real one, then reloads every 6h to pick it up; certbot renews on a 12h loop |
 | `extensions.nginx.tls_internal: true` | Self-signed certs via openssl in entrypoint |
 | `extensions.nginx.tls_cert_path: /path` | User-provided certs mounted read-only |
 
