@@ -27,6 +27,15 @@ Nginx reverse proxy provider for [dekube](https://dekube.io) — converts Ingres
 | `extensions.nginx.tls_internal: true` | Self-signed certs via openssl in entrypoint |
 | `extensions.nginx.tls_cert_path: /path` | User-provided certs mounted read-only |
 
+**Network requirement:** `tls_internal` and the ACME placeholder both generate their self-signed
+cert with the `openssl` CLI, which `nginx:alpine` doesn't ship (verified: `docker run --rm
+nginx:alpine which openssl` → not found) — the nginx container `apk add --no-cache openssl` on
+first start if the binary isn't already there. That means **both** TLS-generation modes now need
+outbound network access to Alpine's package mirrors at container start, not just ACME (which
+already needed internet to reach Let's Encrypt). On a fully offline/air-gapped Docker host,
+`tls_internal: true` will fail to `apk add` and crash-loop nginx — bake `openssl` into a custom
+image, or use a base image that already ships it, if that's your situation.
+
 ## Configuration
 
 Extension config in `dekube.yaml`:
