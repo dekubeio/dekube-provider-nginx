@@ -179,25 +179,36 @@ def _certbot_script(domains: list[str], email: str, domain_flags: str) -> str:
       for real, so it's left alone on subsequent restarts (re-deleting a
       valid lineage every restart would force re-issuance and risk the
       Let's Encrypt rate limit).
-    - `certonly` is retried with capped exponential backoff (60s -> 30min)
+    - `certonly` is retried with capped exponential backoff (5min -> 60min)
       instead of falling straight into the renew loop: `certbot renew` only
       touches domains that already have a lineage, so a first-run failure
       (DNS not propagated yet, a transient CA hiccup, rate limiting) would
       otherwise leave nginx stuck on the throwaway self-signed cert forever,
       with nothing retrying.
+
+      Ramp tuned against Let's Encrypt's own limit (letsencrypt.org/docs/rate-limits/,
+      "Authorization Failures per Hostname per Account"): up to 5 failures per
+      identifier per account per hour, refilling at 1 per 12min. Schedule here
+      (delay starts at 300s, doubles, clamped to 3600s): attempts at
+      t = 0, 300, 900, 2100, 4500, 8100, 11700, ... (i.e. every 3600s once
+      capped) — at most 4 attempts fall inside any rolling 60-minute window
+      (e.g. t=0,300,900,2100), staying under LE's 5/hour budget with one
+      attempt of headroom; the capped steady state (1/hour) is well under the
+      1-per-12min refill rate too.
     """
     script = (
         f"for d in {' '.join(domains)}; do "
         "test -f /etc/letsencrypt/renewal/$d.conf || "
         "rm -rf /etc/letsencrypt/live/$d /etc/letsencrypt/archive/$d; "
         "done\n"
-        "delay=60\n"
+        "delay=300\n"
         f"until certbot certonly --webroot -w /var/www/certbot "
         f"--email {email} --agree-tos --no-eff-email "
         f"--non-interactive {domain_flags}; do\n"
         '  echo "certbot: initial issuance failed, retrying in ${delay}s" >&2\n'
         "  sleep $delay\n"
-        "  [ $delay -lt 1800 ] && delay=$((delay * 2))\n"
+        "  delay=$((delay * 2))\n"
+        "  [ $delay -gt 3600 ] && delay=3600\n"
         "done\n"
         "trap exit TERM\n"
         "while :; do\n"
