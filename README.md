@@ -64,16 +64,16 @@ Works with any ingress rewriter (nginx, haproxy, traefik). The rewriter translat
 
 ## Code quality
 
-*Last updated: 2026-03-07*
+*Last updated: 2026-09-24*
 
 | Metric | Value |
 |--------|-------|
-| Pylint | 9.92/10 |
+| Pylint | 9.78/10 |
 | Pyflakes | clean |
-| Radon MI | 45.96 (A) |
-| Radon avg CC | 5.3 (B) |
+| Radon MI | 53.37 (A) |
+| Radon avg CC | 6.3 (B) |
 
-Worst CC: `NginxProvider.build_service` (14, C).
+Worst CC: `NginxProvider.build_service` (19, C), `_write_server_block` (12, C). No function rated D or worse.
 
 The `E0401: Unable to import 'dekube'` is expected — extensions import from dekube-engine at runtime, not at lint time.
 
