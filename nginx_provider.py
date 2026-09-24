@@ -34,6 +34,14 @@ class NginxProvider(IngressProvider):
         nginx_volumes = [f"./{conf_file}:/etc/nginx/nginx.conf:ro"]
         ports = ["80:80"]
 
+        # nginx:alpine ships libssl but not the openssl CLI — verified with
+        # `docker run --rm nginx:alpine which openssl` (not found). Both
+        # self-signed-cert branches (tls_internal below, and the ACME
+        # placeholder further down) need it; apk add it lazily (skip if
+        # already there, e.g. a same-container restart) rather than baking a
+        # custom image for one binary.
+        openssl_bootstrap = "command -v openssl >/dev/null 2>&1 || apk add --no-cache openssl >/dev/null 2>&1"
+
         if use_tls:
             ports.append("443:443")
             if tls_internal:
@@ -53,8 +61,11 @@ class NginxProvider(IngressProvider):
                     "ports": ports,
                     "volumes": nginx_volumes,
                     "entrypoint": ["/bin/sh", "-c",
-                                   f"mkdir -p /etc/nginx/certs && {cert_cmds} "
-                                   f"&& nginx -g 'daemon off;'"],
+                                   f"{openssl_bootstrap} && mkdir -p /etc/nginx/certs && {cert_cmds} "
+                                   # exec so SIGTERM reaches nginx directly
+                                   # instead of waiting out sh's default
+                                   # signal handling (10s grace -> SIGKILL).
+                                   f"&& exec nginx -g 'daemon off;'"],
                 }}
             elif tls_cert_path:
                 # User-provided certs
@@ -89,11 +100,6 @@ class NginxProvider(IngressProvider):
                     for d in domains
                     if d
                 ) or "true"
-                # nginx:alpine ships libssl but not the openssl CLI — verified
-                # with `docker run --rm nginx:alpine which openssl` (not found).
-                # apk add it lazily (skip if already there, e.g. a same-container
-                # restart) rather than baking a custom image for one binary.
-                openssl_bootstrap = "command -v openssl >/dev/null 2>&1 || apk add --no-cache openssl >/dev/null 2>&1"
                 services = {
                     "nginx": {
                         "image": "nginx:alpine", "restart": "always",
@@ -109,7 +115,10 @@ class NginxProvider(IngressProvider):
                             # compose stack. Ceiling: up to 6h of stale cert
                             # after a renewal.
                             "(while :; do sleep 6h; nginx -s reload; done &) "
-                            "&& nginx -g 'daemon off;'",
+                            # exec so SIGTERM reaches nginx directly instead of
+                            # waiting out sh's default signal handling (10s
+                            # grace -> SIGKILL).
+                            "&& exec nginx -g 'daemon off;'",
                         ],
                     },
                     "certbot": {
@@ -120,30 +129,7 @@ class NginxProvider(IngressProvider):
                         ],
                         "entrypoint": [
                             "/bin/sh", "-c",
-                            # Clear nginx's placeholder before the FIRST real
-                            # issuance only: a renewal.conf means certbot has
-                            # already claimed the domain for real, so leave
-                            # it alone on subsequent restarts (re-deleting a
-                            # valid lineage every restart would force
-                            # re-issuance and risk the Let's Encrypt rate
-                            # limit).
-                            # $$d / $$! double-$: compose interpolates single-$
-                            # references in the YAML itself, so the shell
-                            # variables the *container* should see need escaping
-                            # (dekube-engine does this automatically for
-                            # workload command/args via
-                            # _escape_shell_vars_for_compose, but a provider
-                            # authoring its own entrypoint has to do it by hand).
-                            f"for d in {' '.join(domains)}; do "
-                            "test -f /etc/letsencrypt/renewal/$$d.conf || "
-                            "rm -rf /etc/letsencrypt/live/$$d /etc/letsencrypt/archive/$$d; "
-                            "done && "
-                            f"certbot certonly --webroot -w /var/www/certbot "
-                            f"--email {email} --agree-tos --no-eff-email "
-                            f"--non-interactive {domain_flags}; "
-                            "trap exit TERM; "
-                            "while :; do sleep 12h & wait $$!; "
-                            "certbot renew --webroot -w /var/www/certbot --quiet; done",
+                            _certbot_script(domains, email, domain_flags),
                         ],
                     },
                 }
@@ -183,6 +169,48 @@ class NginxProvider(IngressProvider):
                 _write_server_block(f, host, host_entries, tls)
             f.write("}\n")
         print(f"Wrote {path}", file=sys.stderr)
+
+
+def _certbot_script(domains: list[str], email: str, domain_flags: str) -> str:
+    """Build the certbot entrypoint: cleanup, retry-until-issued, then renew loop.
+
+    - Deletes nginx's placeholder live/archive dir before the FIRST real
+      issuance only: a renewal.conf means certbot already claimed the domain
+      for real, so it's left alone on subsequent restarts (re-deleting a
+      valid lineage every restart would force re-issuance and risk the
+      Let's Encrypt rate limit).
+    - `certonly` is retried with capped exponential backoff (60s -> 30min)
+      instead of falling straight into the renew loop: `certbot renew` only
+      touches domains that already have a lineage, so a first-run failure
+      (DNS not propagated yet, a transient CA hiccup, rate limiting) would
+      otherwise leave nginx stuck on the throwaway self-signed cert forever,
+      with nothing retrying.
+    """
+    script = (
+        f"for d in {' '.join(domains)}; do "
+        "test -f /etc/letsencrypt/renewal/$d.conf || "
+        "rm -rf /etc/letsencrypt/live/$d /etc/letsencrypt/archive/$d; "
+        "done\n"
+        "delay=60\n"
+        f"until certbot certonly --webroot -w /var/www/certbot "
+        f"--email {email} --agree-tos --no-eff-email "
+        f"--non-interactive {domain_flags}; do\n"
+        '  echo "certbot: initial issuance failed, retrying in ${delay}s" >&2\n'
+        "  sleep $delay\n"
+        "  [ $delay -lt 1800 ] && delay=$((delay * 2))\n"
+        "done\n"
+        "trap exit TERM\n"
+        "while :; do\n"
+        "  sleep 12h & wait $!\n"
+        "  certbot renew --webroot -w /var/www/certbot --quiet\n"
+        "done"
+    )
+    # Compose interpolates single-$ references in the YAML itself, so every
+    # shell variable meant for the *container* has to be escaped as $$
+    # (dekube-engine does this automatically for K8s-derived command/args via
+    # _escape_shell_vars_for_compose, but a provider authoring its own raw
+    # entrypoint string has to do it by hand).
+    return script.replace("$", "$$")
 
 
 def _resolve_tls(ext_cfg: dict) -> dict:
